@@ -2,6 +2,12 @@
 
 这是从上游真实项目父版本整理出的独立 Python 基础快照，保留复现缺陷所需的源码、测试和配置。
 
+安装依赖：
+
+```bash
+pip install "beets[chroma]==2.14.1" pytest
+```
+
 运行测试：
 
 ```bash
