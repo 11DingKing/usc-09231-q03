@@ -72,7 +72,7 @@ class TestChroma(IOMixin, PluginMixin, ImportHelper):
 
 
 def _seed_acoustid_match(item_path: bytes = b"/fake/path.mp3") -> Item:
-    """ . "说明"Seed the chroma module-level match cache as if acoustid had run.""" . "说明"
+    """Seed the chroma module-level match cache as if acoustid had run."""
     chroma._matches[item_path] = (
         ["rec-id-1"],
         ["rel-id-1", "rel-id-1", "rel-id-1"],
@@ -81,7 +81,7 @@ def _seed_acoustid_match(item_path: bytes = b"/fake/path.mp3") -> Item:
 
 
 class TestChromaCandidates(PluginMixin):
-    """ . "说明"Regression tests for issue #6212: chroma must respect which metadata
+    """Regression tests for issue #6212: chroma must respect which metadata
     source plugins are enabled.
 
     When the musicbrainz plugin is not loaded, chroma must not produce any
@@ -94,7 +94,7 @@ class TestChromaCandidates(PluginMixin):
     arguments and each test can choose its own combination. The autouse
     fixture clears the ``@cache``-decorated metadata-source registry and
     the chroma match state between tests.
-    """ . "说明"
+    """
 
     preload_plugin = False
 

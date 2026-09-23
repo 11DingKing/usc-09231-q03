@@ -1,11 +1,15 @@
-""" . "说明"Adds Chromaprint/Acoustid acoustic fingerprinting support to the
+"""Adds Chromaprint/Acoustid acoustic fingerprinting support to the
 autotagger. Requires the pyacoustid library.
-""" . "说明"
+"""
 
 from __future__ import annotations
 
+import errno
 import heapq
+import os
 import re
+import signal
+import subprocess
 from collections import defaultdict
 from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, Protocol
@@ -46,6 +50,20 @@ COMMON_REL_THRESH = 0.6  # How many tracks must have an album in common?
 MAX_RECORDINGS = 5
 MAX_RELEASES = 5
 
+# External fingerprint calculator ("fpcalc") configuration. The
+# calculator is a short-lived subprocess: one invocation per track, so
+# every pipe and process handle it creates must be released again even
+# when the calculator fails -- long multi-disc imports otherwise leak
+# file descriptors until unrelated later tasks start failing.
+FPCALC_COMMAND = "fpcalc"
+FPCALC_ENVVAR = "FPCALC"
+MAX_AUDIO_LENGTH = acoustid.MAX_AUDIO_LENGTH
+# Bound the time spent waiting on the calculator. If the calculator
+# exits but a descendant keeps the stdout pipe open, communicate() would
+# block forever and leak the pipe; the timeout lets us kill the whole
+# process group and release everything.
+FPCALC_TIMEOUT: float = 30.0
+
 # Stores the Acoustid match information for each track. This is
 # populated when an import task begins and then used when searching for
 # candidates. It maps audio file paths to (recording_ids, release_ids)
@@ -61,7 +79,7 @@ _acoustids: dict[bytes, str] = {}
 
 
 def prefix(it: Iterable[Any], count: int) -> Iterator[Any]:
-    """ . "说明"Truncate an iterable to at most `count` items.""" . "说明"
+    """Truncate an iterable to at most `count` items."""
     for i, v in enumerate(it):
         if i >= count:
             break
@@ -71,7 +89,7 @@ def prefix(it: Iterable[Any], count: int) -> Iterator[Any]:
 def releases_key(
     release: JSONDict, countries: Sequence[re.Pattern[str]], original_year: bool
 ) -> tuple[int, int, int, int]:
-    """ . "说明"Used as a key to sort releases by date then preferred country""" . "说明"
+    """Used as a key to sort releases by date then preferred country"""
     date = release.get("date")
     if date and original_year:
         year = date.get("year", 9999)
@@ -93,12 +111,144 @@ def releases_key(
     return (year, month, day, country_key)
 
 
-def acoustid_match(log: Logger, path: bytes) -> None:
-    """ . "说明"Gets metadata for a file from Acoustid and populates the
-    _matches, _fingerprints, and _acoustids dictionaries accordingly.
-    """ . "说明"
+def _run_fpcalc(path: str) -> tuple[float, bytes]:
+    """Run the external ``fpcalc`` calculator and parse its output.
+
+    The calculator is invoked once per track, so a batch import starts
+    hundreds of short-lived subprocesses in a row. Every process and pipe
+    handle created here is released before the function returns or raises,
+    no matter whether the calculator is missing, is killed, exits
+    non-zero, or prints no usable output -- otherwise the leaked
+    descriptors accumulate over a long-running analysis session and
+    eventually make unrelated later tasks fail.
+
+    Raises :class:`acoustid.NoBackendError` when the calculator is not
+    installed and :class:`acoustid.FingerprintGenerationError` for every
+    other failure (empty output, non-zero exit status, unparseable or
+    partial output).
+    """
+    fpcalc = os.environ.get(FPCALC_ENVVAR, FPCALC_COMMAND)
+    command = [fpcalc, "-length", str(MAX_AUDIO_LENGTH), path]
+
+    proc: subprocess.Popen[bytes] | None = None
+
+    def reap() -> bytes:
+        """Read the calculator output, reaping it even on failure.
+
+        Returns the stdout bytes. On timeout or interruption the whole
+        process group is killed and reaped so no descendant can keep
+        the inherited stdout pipe (and thus this process's descriptor)
+        open.
+        """
+        assert proc is not None
+        try:
+            output, _ = proc.communicate(timeout=FPCALC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _terminate_proc_group(proc)
+            output, _ = proc.communicate()
+            raise acoustid.FingerprintGenerationError(
+                f"fpcalc timed out after {FPCALC_TIMEOUT:g}s"
+            ) from None
+        except BaseException:
+            # KeyboardInterrupt / SystemExit while reading: kill the
+            # calculator and its descendants and reap before unwinding.
+            _terminate_proc_group(proc)
+            proc.wait()
+            raise
+        return output
+
     try:
-        duration, fp = acoustid.fingerprint_file(util.syspath(path))
+        # ``devnull`` is held open only while spawning and reading; the
+        # child inherits its descriptor, but the parent's copy is closed
+        # by the ``with`` block. ``start_new_session`` puts the child in
+        # its own process group so a stuck descendant can be reaped too.
+        with open(os.devnull, "wb") as devnull:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=devnull,
+                close_fds=True,
+                start_new_session=True,
+            )
+            output = reap()
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise acoustid.NoBackendError("fpcalc not found") from exc
+        raise acoustid.FingerprintGenerationError(
+            f"fpcalc invocation failed: {exc}"
+        ) from exc
+
+    # communicate() has reaped the process; returncode is always set.
+    retcode = proc.returncode
+    if retcode:
+        raise acoustid.FingerprintGenerationError(
+            f"fpcalc exited with status {retcode}"
+        )
+
+    duration: float | None = None
+    fp: bytes | None = None
+    for line in output.splitlines():
+        parts = line.split(b"=", 1)
+        if len(parts) != 2:
+            # Tolerate stray or malformed lines rather than failing the
+            # whole calculation on them.
+            continue
+        key, value = parts
+        if key == b"DURATION":
+            try:
+                duration = float(value)
+            except ValueError:
+                raise acoustid.FingerprintGenerationError(
+                    "fpcalc duration not numeric"
+                ) from None
+        elif key == b"FINGERPRINT":
+            fp = value
+
+    # Empty output, missing DURATION/FINGERPRINT lines, or an empty
+    # fingerprint value are all treated as generation failures.
+    if duration is None or not fp:
+        raise acoustid.FingerprintGenerationError("missing fpcalc output")
+    return duration, fp
+
+
+def _terminate_proc_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill ``proc`` and every descendant it created, then reap it."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        # Fall back to terminating just the direct child.
+        proc.kill()
+    try:
+        proc.wait(timeout=FPCALC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _fingerprint_file(path: str) -> tuple[float, bytes]:
+    """Fingerprint a file, owning the resource lifecycle of whichever
+    backend is used.
+
+    When the Chromaprint library is available, fingerprinting happens
+    in-process and no operating-system handles are involved. Otherwise
+    the external ``fpcalc`` calculator is launched through
+    :func:`_run_fpcalc`, which guarantees that every process and pipe
+    handle is released even on failure.
+    """
+    if acoustid.have_audioread and acoustid.have_chromaprint:
+        return acoustid.fingerprint_file(path)
+    return _run_fpcalc(path)
+
+
+def acoustid_match(log: Logger, path: bytes) -> None:
+    """Gets metadata for a file from Acoustid and populates the
+    _matches, _fingerprints, and _acoustids dictionaries accordingly.
+    """
+    try:
+        duration, fp = _fingerprint_file(util.syspath(path))
     except acoustid.FingerprintGenerationError as exc:
         log.error(
             "fingerprinting of {} failed: {}",
@@ -166,9 +316,9 @@ def acoustid_match(log: Logger, path: bytes) -> None:
 
 
 def _all_releases(items: Sequence[Item]) -> Iterator[str]:
-    """ . "说明"Given an iterable of Items, determines (according to Acoustid)
+    """Given an iterable of Items, determines (according to Acoustid)
     which releases the items have in common. Generates release IDs.
-    """ . "说明"
+    """
     # Count the number of "hits" for each release.
     relcounts = defaultdict[str, int](int)
     for item in items:
@@ -196,7 +346,7 @@ class AcoustidPlugin(MetadataSourcePlugin):
 
     @cached_property
     def mb(self) -> MusicBrainzPlugin | None:
-        """ . "说明"The loaded MusicBrainz plugin, or ``None``.
+        """The loaded MusicBrainz plugin, or ``None``.
 
         Acoustid lookups return MusicBrainz IDs, so chroma needs the
         ``musicbrainz`` plugin to resolve them into album/track
@@ -206,7 +356,7 @@ class AcoustidPlugin(MetadataSourcePlugin):
         Uses the plugin registry so that any plugin that swaps the
         musicbrainz instance at runtime (e.g. :doc:`plugins/mbpseudo`)
         is respected.
-        """ . "说明"
+        """
         plugin = get_metadata_source("musicbrainz")
         if plugin is None:
             self._log.debug(
@@ -386,15 +536,15 @@ class AcoustidPlugin(MetadataSourcePlugin):
 def fingerprint_task(
     log: Logger, task: ImportTask, session: ImportSession
 ) -> None:
-    """ . "说明"Fingerprint each item in the task for later use during the
+    """Fingerprint each item in the task for later use during the
     autotagging candidate search.
-    """ . "说明"
+    """
     for item in task.items:
         acoustid_match(log, item.path)
 
 
 def apply_acoustid_metadata(task: ImportTask, session: ImportSession) -> None:
-    """ . "说明"Apply Acoustid metadata (fingerprint and ID) to the task's items.""" . "说明"
+    """Apply Acoustid metadata (fingerprint and ID) to the task's items."""
     for item in task.imported_items():
         if item.path in _fingerprints:
             item.acoustid_fingerprint = _fingerprints[item.path]
@@ -408,12 +558,12 @@ def apply_acoustid_metadata(task: ImportTask, session: ImportSession) -> None:
 def submit_items(
     log: Logger, userkey: str, items: Sequence[Item], chunksize: int = 64
 ) -> None:
-    """ . "说明"Submit fingerprints for the items to the Acoustid server.""" . "说明"
+    """Submit fingerprints for the items to the Acoustid server."""
     # The running list of dictionaries to submit.
     data: list[JSONDict] = []
 
     def submit_chunk() -> None:
-        """ . "说明"Submit the current accumulated fingerprint data.""" . "说明"
+        """Submit the current accumulated fingerprint data."""
         log.info("submitting {} fingerprints", len(data))
         try:
             acoustid.submit(API_KEY, userkey, data, timeout=10)
@@ -456,12 +606,12 @@ def submit_items(
 def fingerprint_item(
     log: Logger, item: Item, write: bool = False, quiet: bool = False
 ) -> str | None:
-    """ . "说明"Get the fingerprint for an Item. If the item already has a
+    """Get the fingerprint for an Item. If the item already has a
     fingerprint, it is not regenerated. If fingerprint generation fails,
     return None. If the items are associated with a library, they are
     saved to the database. If `write` is set, then the new fingerprints
     are also written to files' metadata.
-    """ . "说明"
+    """
     # Get a fingerprint and length for this track.
     if not item.length:
         log.info("{.filepath}: no duration available", item)
@@ -475,7 +625,7 @@ def fingerprint_item(
     else:
         log.info("{.filepath}: fingerprinting", item)
         try:
-            _, fp = acoustid.fingerprint_file(util.syspath(item.path))
+            _, fp = _fingerprint_file(util.syspath(item.path))
             item.acoustid_fingerprint = fp.decode()
             if write:
                 log.info("{.filepath}: writing fingerprint", item)
